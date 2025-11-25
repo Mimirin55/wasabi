@@ -11,6 +11,7 @@ use core::marker::PhantomData;
 use core::mem::offset_of;
 use core::mem::size_of;
 use core::mem::size_of_val;
+use core::mem::MaybeUninit;
 use core::pin::Pin;
 
 pub fn hlt() {
@@ -59,8 +60,7 @@ const ATTR_CACHE_DISABLE: u64 = 1 << 4;
 pub enum PageAttr {
     NotPresent = 0,
     ReadWriteKernel = ATTR_PRESENT | ATTR_WRITABLE,
-    ReadWriteIo =
-        ATTR_PRESENT | ATTR_WRITABLE | ATTR_WRITE_THROUGH | ATTR_CACHE_DISABLE,
+    ReadWriteIo = ATTR_PRESENT | ATTR_WRITABLE | ATTR_WRITE_THROUGH | ATTR_CACHE_DISABLE,
 }
 #[derive(Debug, Eq, PartialEq)]
 pub enum TranslationResult {
@@ -107,17 +107,44 @@ impl<const LEVEL: usize, const SHIFT: usize, NEXT> Entry<LEVEL, SHIFT, NEXT> {
             Err("Page Not Found")
         }
     }
+    fn table_mut(&mut self) -> Result<&mut NEXT> {
+        if self.is_present() {
+            Ok(unsafe { &mut *((self.value & !ATTR_MASK) as *mut NEXT) })
+        } else {
+            Err("Page Not Found")
+        }
+    }
+    fn set_page(&mut self, phys: u64, attr: PageAttr) -> Result<()> {
+        if phys & ATTR_MASK != 0 {
+            Err("phys is not aligned")
+        } else {
+            self.value = phys | attr as u64;
+            Ok(())
+        }
+    }
+    fn populate(&mut self) -> Result<&mut Self> {
+        if self.is_present() {
+            Err("phys is already populated")
+        } else {
+            let next: Box<NEXT> = Box::new(unsafe { MaybeUninit::zeroed().assume_init() });
+            self.value = Box::into_raw(next) as u64 | PageAttr::ReadWriteKernel as u64;
+            Ok(self)
+        }
+    }
+    fn ensure_populated(&mut self) -> Result<&mut Self> {
+        if self.is_present() {
+            Ok(self)
+        } else {
+            self.populate()
+        }
+    }
 }
-impl<const LEVEL: usize, const SHIFT: usize, NEXT> fmt::Display
-    for Entry<LEVEL, SHIFT, NEXT>
-{
+impl<const LEVEL: usize, const SHIFT: usize, NEXT> fmt::Display for Entry<LEVEL, SHIFT, NEXT> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         self.format(f)
     }
 }
-impl<const LEVEL: usize, const SHIFT: usize, NEXT> fmt::Debug
-    for Entry<LEVEL, SHIFT, NEXT>
-{
+impl<const LEVEL: usize, const SHIFT: usize, NEXT> fmt::Debug for Entry<LEVEL, SHIFT, NEXT> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         self.format(f)
     }
@@ -127,9 +154,7 @@ impl<const LEVEL: usize, const SHIFT: usize, NEXT> fmt::Debug
 pub struct Table<const LEVEL: usize, const SHIFT: usize, NEXT> {
     entry: [Entry<LEVEL, SHIFT, NEXT>; 512],
 }
-impl<const LEVEL: usize, const SHIFT: usize, NEXT: core::fmt::Debug>
-    Table<LEVEL, SHIFT, NEXT>
-{
+impl<const LEVEL: usize, const SHIFT: usize, NEXT: core::fmt::Debug> Table<LEVEL, SHIFT, NEXT> {
     fn format(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln!(f, "L{}Table @ {:#p} {{", LEVEL, self)?;
         for i in 0..512 {
@@ -144,6 +169,9 @@ impl<const LEVEL: usize, const SHIFT: usize, NEXT: core::fmt::Debug>
     pub fn next_level(&self, index: usize) -> Option<&NEXT> {
         self.entry.get(index).and_then(|e| e.table().ok())
     }
+    fn calc_index(&self, addr: u64) -> usize {
+        ((addr >> SHIFT) & 0b1_1111_1111) as usize
+    }
 }
 impl<const LEVEL: usize, const SHIFT: usize, NEXT: fmt::Debug> fmt::Debug
     for Table<LEVEL, SHIFT, NEXT>
@@ -157,6 +185,45 @@ pub type PT = Table<1, 12, [u8; PAGE_SIZE]>;
 pub type PD = Table<2, 21, PT>;
 pub type PDPT = Table<3, 30, PD>;
 pub type PML4 = Table<4, 39, PDPT>;
+
+impl PML4 {
+    pub fn new() -> Box<Self> {
+        Box::new(Self::default())
+    }
+    fn default() -> Self {
+        // This is safe since entries filled with 0 is valid.
+        unsafe { MaybeUninit::zeroed().assume_init() }
+    }
+    pub fn create_mapping(
+        &mut self,
+        virt_start: u64,
+        virt_end: u64,
+        phys: u64,
+        attr: PageAttr,
+    ) -> Result<()> {
+        if virt_start & ATTR_MASK != 0 {
+            return Err("Invalid virt_start");
+        }
+        if virt_end & ATTR_MASK != 0 {
+            return Err("Invalid virt_end");
+        }
+        if phys & ATTR_MASK != 0 {
+            return Err("Invalid phys");
+        }
+        for addr in (virt_start..virt_end).step_by(PAGE_SIZE) {
+            let index = self.calc_index(addr);
+            let table = self.entry[index].ensure_populated()?.table_mut()?;
+            let index = table.calc_index(addr);
+            let table = table.entry[index].ensure_populated()?.table_mut()?;
+            let index = table.calc_index(addr);
+            let table = table.entry[index].ensure_populated()?.table_mut()?;
+            let index = table.calc_index(addr);
+            let pte = &mut table.entry[index];
+            pte.set_page(phys + addr - virt_start, attr)?;
+        }
+        Ok(())
+    }
+}
 
 /// # Safety
 /// Anything can happen if the given selector is invalid.
@@ -208,7 +275,6 @@ pub unsafe fn write_gs(selector: u16) {
             in ("ax") selector)
 }
 
-
 #[allow(dead_code)]
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -235,7 +301,7 @@ struct GeneralRegisterContext {
     r15: u64,
     rcx: u64,
 }
-const _: () =assert!(size_of::<GeneralRegisterContext>() == (16 - 1) * 8);
+const _: () = assert!(size_of::<GeneralRegisterContext>() == (16 - 1) * 8);
 #[allow(dead_code)]
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -246,7 +312,7 @@ struct InterruptContext {
     rsp: u64,
     ss: u64,
 }
-const _: () =assert!(size_of::<InterruptContext>() == 8 * 5);
+const _: () = assert!(size_of::<InterruptContext>() == 8 * 5);
 #[allow(dead_code)]
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -451,6 +517,7 @@ extern "sysv64" fn inthandler(info: &InterruptInfo, index: usize) {
     match index {
         3 => {
             error!("Breakpoint");
+            return;
         }
         6 => {
             error!("Invalid Opcode");
@@ -712,8 +779,7 @@ pub const BIT_DPL3: u64 = 3u64 << 45;
 
 #[repr(u64)]
 enum GdtAttr {
-    KernelCode =
-        BIT_TYPE_CODE | BIT_PRESENT | BIT_CS_LONG_MODE | BIT_CS_READABLE,
+    KernelCode = BIT_TYPE_CODE | BIT_PRESENT | BIT_CS_LONG_MODE | BIT_CS_READABLE,
     KernelData = BIT_TYPE_DATA | BIT_PRESENT | BIT_DS_WRITABLE,
 }
 
@@ -771,9 +837,7 @@ impl Default for GdtWrapper {
             null_segment: GdtSegmentDescriptor::null(),
             kernel_code_segment: GdtSegmentDescriptor::new(GdtAttr::KernelCode),
             kernel_data_segment: GdtSegmentDescriptor::new(GdtAttr::KernelData),
-            task_state_segment: TaskStateSegment64Descriptor::new(
-                tss64.phys_addr(),
-            ),
+            task_state_segment: TaskStateSegment64Descriptor::new(tss64.phys_addr()),
         };
         let gdt = Box::pin(gdt);
         GdtWrapper { inner: gdt, tss64 }
@@ -825,4 +889,19 @@ const _: () = assert!(size_of::<TaskStateSegment64Descriptor>() == 16);
 
 pub fn trigger_debug_interrupt() {
     unsafe { asm!("int3") }
+}
+
+/// # Safety
+/// Writing to CR3 can causes any exceptions so it is
+/// programmer's responsibility to setup correct page tables.
+#[no_mangle]
+pub unsafe fn write_cr3(table: *const PML4) {
+    asm!("mov cr3, rax",
+        in("rax") table)
+}
+
+pub fn flush_tlb() {
+    unsafe {
+        write_cr3(read_cr3());
+    }
 }
