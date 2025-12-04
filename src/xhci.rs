@@ -5,6 +5,7 @@ use crate::bits::extract_bits;
 use crate::executor::spawn_global;
 use crate::executor::yield_execution;
 use crate::info;
+use crate::keyboard::start_usb_keyboard;
 use crate::mmio::IoBox;
 use crate::mmio::Mmio;
 use crate::mutex::Mutex;
@@ -13,6 +14,8 @@ use crate::pci::BusDeviceFunction;
 use crate::pci::Pci;
 use crate::pci::VendorDeviceId;
 use crate::result::Result;
+use crate::tablet::start_usb_tablet;
+use crate::usb;
 use crate::volatile::Volatile;
 use crate::x86::busy_loop_hint;
 use alloc::boxed::Box;
@@ -26,6 +29,7 @@ use core::future::Future;
 use core::marker::PhantomPinned;
 use core::mem::size_of;
 use core::mem::MaybeUninit;
+use core::mem::transmute;
 use core::ops::Range;
 use core::pin::Pin;
 use core::ptr::read_volatile;
@@ -141,8 +145,98 @@ impl PciXhciDriver {
             info!("xhci: port {port} is connected");
             let slot = Self::init_port(&xhc, port).await?;
             info!("slot {slot} is assigned for port {port}");
-            Self::address_device(&xhc, port, slot).await?;
+            let mut ctrl_ep_ring =
+                Self::address_device(&xhc, port, slot).await?;
             info!("AddressDeviceCommand succeeded");
+            let device_descriptor =
+                usb::request_device_descriptor(&xhc, slot, &mut ctrl_ep_ring)
+                    .await?;
+            info!("Got a DeviceDescriptor: {device_descriptor:?}");
+            let vid = device_descriptor.vendor_id;
+            let pid = device_descriptor.product_id;
+            info!("xhci: device detected: vid:pid = {vid:#06X}:{pid:#06X}",);
+            if let Ok(e) = usb::request_string_descriptor_zero(
+                &xhc,
+                slot,
+                &mut ctrl_ep_ring,
+            )
+            .await
+            {
+                let lang_id = e[1];
+                let vendor = if device_descriptor.manufacture_idx != 0 {
+                    Some(
+                        usb::request_string_descriptor(
+                            &xhc,
+                            slot,
+                            &mut ctrl_ep_ring,
+                            lang_id,device_descriptor.manufacture_idx,
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
+                let product = if device_descriptor.product_idx != 0 {
+                    Some(
+                        usb::request_string_descriptor(
+                            &xhc,
+                            slot,
+                            &mut ctrl_ep_ring,
+                            lang_id,
+                            device_descriptor.product_idx,
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
+                let serial = if device_descriptor.serial_idx != 0 {
+                    Some(
+                        usb::request_string_descriptor(
+                            &xhc,
+                            slot,
+                            &mut ctrl_ep_ring,
+                            lang_id,
+                            device_descriptor.serial_idx,
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
+                info!("xhci: v/p/s = {vendor:?}/{product:?}/{serial:?}");
+                let descriptors = usb::request_config_descriptor_and_rest(
+                    &xhc,
+                    slot,
+                    &mut ctrl_ep_ring,
+                )
+                .await?;
+                info!("xhci: {descriptors:?}");
+                if start_usb_keyboard(
+                    &xhc,
+                    slot,
+                    &mut ctrl_ep_ring,
+                    &descriptors,
+                )
+                .await
+                .is_ok()
+                {
+                    return Ok(());
+                }
+                if start_usb_tablet(
+                    &xhc,
+                    slot,
+                    &mut ctrl_ep_ring,
+                    &device_descriptor,
+                    &descriptors,
+                )
+                .await
+                .is_ok()
+                {
+                    return Ok(());
+                }
+                info!("xhci: No available drivers...");
+            }
         }
         Ok(())
     }
@@ -166,7 +260,7 @@ impl PciXhciDriver {
         xhc: &Rc<Controller>,
         port: usize,
         slot: u8,
-    ) -> Result<()> {
+    ) -> Result<CommandRing> {
         // Setup an input context and send AddressDevice command.
         // 4.3.3 Device Slot Initialization
         let output_context = Box::pin(OutputContext::default());
@@ -195,7 +289,7 @@ impl PciXhciDriver {
         let cmd =
             GenericTrbEntry::cmd_address_device(input_context.as_ref(), slot);
         xhc.send_command(cmd).await?.cmd_result_ok()?;
-        Ok(())
+        Ok(ctrl_ep_ring)
     }
 }
 
@@ -558,7 +652,7 @@ impl DeviceContextBaseAddressArray {
     }
 }
 
-struct Controller {
+pub struct Controller {
     regs: XhcRegisters,
     device_context_base_array: Mutex<DeviceContextBaseAddressArray>,
     primary_event_ring: Mutex<EventRing>,
@@ -619,6 +713,16 @@ impl Controller {
     fn notify_xhc(&self) {
         self.regs.doorbell_regs[0].notify(0, 0);
     }
+    pub fn notify_ep(&self, slot: u8, dci: usize) -> Result<()> {
+        let db = self
+            .regs
+            .doorbell_regs
+            .get(slot as usize)
+            .ok_or("invalid slot")?;
+        let dci = u8::try_from(dci).or(Err("invalid dci"))?;
+        db.notify(dci, 0);
+        Ok(())
+    }
     fn set_output_context_for_slot(
         &self,
         slot: u8,
@@ -627,6 +731,162 @@ impl Controller {
         self.device_context_base_array
             .lock()
             .set_output_context(slot, output_context);
+    }
+    pub async fn request_descriptor<T: Sized>(
+        &self,
+        slot: u8,
+        ctrl_ep_ring: &mut CommandRing,
+        desc_type: usb::UsbDescriptorType,
+        desc_index: u8,
+        lang_id: u16,
+        buf: Pin<&mut [T]>,
+    ) -> Result<()> {
+        ctrl_ep_ring.push(
+            SetupStageTrb::new(
+                SetupStageTrb::REQ_TYPE_DIR_DEVICE_TO_HOST,
+                SetupStageTrb::REQ_GET_DESCRIPTOR,
+                (desc_type as u16) << 8 | (desc_index as u16),
+                lang_id,
+                (buf.len() * size_of::<T>()) as u16,
+            )
+            .into(),
+        )?;
+        let trb_ptr_waiting =
+            ctrl_ep_ring.push(DataStageTrb::new_in(buf).into())?;
+        ctrl_ep_ring.push(StatusStageTrb::new_out().into())?;
+        self.notify_ep(slot, 1)?;
+        EventFuture::new_for_trb(&self.primary_event_ring, trb_ptr_waiting)
+            .await?
+            .transfer_result_ok()
+    }
+    pub async fn request_descriptor_for_interface<T: Sized>(
+        &self,
+        slot: u8,
+        ctrl_ep_ring: &mut CommandRing,
+        desc_type: usb::UsbDescriptorType,
+        desc_index: u8,
+        w_index: u16,
+        buf: Pin<&mut [T]>,
+    ) -> Result<()> {
+        ctrl_ep_ring.push(
+            SetupStageTrb::new(
+                SetupStageTrb::REQ_TYPE_DIR_DEVICE_TO_HOST
+                    | SetupStageTrb::REQ_TYPE_TO_INTERFACE,
+                SetupStageTrb::REQ_GET_DESCRIPTOR,
+                (desc_type as u16) << 8 | (desc_index as u16),
+                w_index,
+                (buf.len() * size_of::<T>()) as u16,
+            )
+            .into(),
+        )?;
+        let trb_ptr_waiting =
+            ctrl_ep_ring.push(DataStageTrb::new_in(buf).into())?;
+        ctrl_ep_ring.push(StatusStageTrb::new_out().into())?;
+        self.notify_ep(slot, 1)?;
+        EventFuture::new_for_trb(&self.primary_event_ring, trb_ptr_waiting)
+            .await?
+            .transfer_result_ok()
+    }
+    pub async fn request_report_bytes(
+        &self,
+        slot: u8,
+        ctrl_ep_ring: &mut CommandRing,
+        buf: Pin<&mut [u8]>,
+    ) -> Result<()> {
+        // [HID] 7.2.1 Get_Report Request
+        ctrl_ep_ring.push(
+            SetupStageTrb::new(
+                SetupStageTrb::REQ_TYPE_DIR_DEVICE_TO_HOST
+                    | SetupStageTrb::REQ_TYPE_TYPE_CLASS
+                    | SetupStageTrb::REQ_TYPE_TO_INTERFACE,
+                SetupStageTrb::REQ_GET_REPORT,
+                0x0200, /* Report Type | Report ID */
+                0,
+                buf.len() as u16,
+            )
+            .into(),
+        )?;
+        let trb_ptr_waiting =
+            ctrl_ep_ring.push(DataStageTrb::new_in(buf).into())?;
+        ctrl_ep_ring.push(StatusStageTrb::new_out().into())?;
+        self.notify_ep(slot, 1)?;
+        EventFuture::new_for_trb(&self.primary_event_ring, trb_ptr_waiting)
+            .await?
+            .transfer_result_ok()
+    }
+    pub async fn request_set_config(
+        &self,
+        slot: u8,
+        ctrl_ep_ring: &mut CommandRing,
+        config_value: u8,
+    ) -> Result<()> {
+        ctrl_ep_ring.push(
+            SetupStageTrb::new(
+                0,
+                SetupStageTrb::REQ_SET_CONFIGURATION,
+                config_value as u16,
+                0,
+                0,
+            )
+            .into(),
+        )?;
+        let trb_ptr_waiting =
+            ctrl_ep_ring.push(StatusStageTrb::new_in().into())?;
+        self.notify_ep(slot, 1)?;
+        EventFuture::new_for_trb(&self.primary_event_ring, trb_ptr_waiting)
+            .await?
+            .transfer_result_ok()
+    }
+    pub async fn request_set_interface(
+        &self,
+        slot: u8,
+        ctrl_ep_ring: &mut CommandRing,
+        interface_number: u8,
+        alt_setting: u8,
+    ) -> Result<()> {
+        ctrl_ep_ring.push(
+            SetupStageTrb::new(
+                SetupStageTrb::REQ_TYPE_TO_INTERFACE,
+                SetupStageTrb::REQ_SET_INTERFACE,
+                alt_setting as u16,
+                interface_number as u16,
+                0,
+            )
+            .into(),
+        )?;
+        let trb_ptr_waiting =
+            ctrl_ep_ring.push(StatusStageTrb::new_in().into())?;
+        self.notify_ep(slot, 1)?;
+        EventFuture::new_for_trb(&self.primary_event_ring, trb_ptr_waiting)
+            .await?
+            .transfer_result_ok()
+    }
+    pub async fn request_set_protocol(
+        &self,
+        slot: u8,
+        ctrl_ep_ring: &mut CommandRing,
+        interface_number: u8,
+        protocol: u8,
+    ) -> Result<()> {
+        // protocol:
+        // 0: Boot Protocol
+        // 1: Report Protocol
+        ctrl_ep_ring.push(
+            SetupStageTrb::new(
+                SetupStageTrb::REQ_TYPE_TO_INTERFACE,
+                SetupStageTrb::REQ_SET_PROTOCOL,
+                protocol as u16,
+                interface_number as u16,
+                0,
+            )
+            .into(),
+        )?;
+        let trb_ptr_waiting =
+            ctrl_ep_ring.push(StatusStageTrb::new_in().into())?;
+        self.notify_ep(slot, 1)?;
+        EventFuture::new_for_trb(&self.primary_event_ring, trb_ptr_waiting)
+            .await?
+            .transfer_result_ok()
     }
 }
 
@@ -836,6 +1096,10 @@ struct GenericTrbEntry {
 }
 const _: () = assert!(size_of::<GenericTrbEntry>() == 16);
 impl GenericTrbEntry {
+    const CTRL_BIT_INTERRUPT_ON_SHORT_PACKET: u32 = 1 << 2;
+    const CTRL_BIT_INTERRUPT_ON_COMPLETION: u32 = 1 << 5;
+    const CTRL_BIT_IMMEDIATE_DATA: u32 = 1 << 6;
+    const CTRL_BIT_DATA_DIR_IN: u32 = 1 << 16;
     fn trb_link(ring: &TrbRing) -> Self {
         let mut trb = GenericTrbEntry::default();
         trb.set_trb_type(TrbType::Link);
@@ -885,6 +1149,19 @@ impl GenericTrbEntry {
             Ok(())
         }
     }
+    fn transfer_result_ok(&self) -> Result<()> {
+        if self.trb_type() != TrbType::TransferEvent as u32 {
+            Err("Not a TransferEvent")
+        } else if self.completion_code() != 1 && self.completion_code() != 13 {
+            info!(
+                "Transfer failed. Actual CompletionCode = {}",
+                self.completion_code()
+            );
+            Err("CompletionCode was not Success")
+        } else {
+            Ok(())
+        }
+    }
     fn set_slot_id(&mut self, slot: u8) {
         self.control.write_bits(24, 8, slot as u32).unwrap()
     }
@@ -897,8 +1174,25 @@ impl GenericTrbEntry {
         trb
     }
 }
+// Following From<*Trb> impls are safe
+// since GenericTrbEntry generated from any TRB will be valid.
+impl From<SetupStageTrb> for GenericTrbEntry {
+    fn from(trb: SetupStageTrb) -> GenericTrbEntry {
+        unsafe { transmute(trb) }
+    }
+}
+impl From<DataStageTrb> for GenericTrbEntry {
+    fn from(trb: DataStageTrb) -> GenericTrbEntry {
+        unsafe { transmute(trb) }
+    }
+}
+impl From<StatusStageTrb> for GenericTrbEntry {
+    fn from(trb: StatusStageTrb) -> GenericTrbEntry {
+        unsafe { transmute(trb) }
+    }
+}
 
-struct CommandRing {
+pub struct CommandRing {
     ring: IoBox<TrbRing>,
     cycle_state_ours: bool,
 }
@@ -906,7 +1200,7 @@ impl CommandRing {
     fn ring_phys_addr(&self) -> u64 {
         self.ring.as_ref() as *const TrbRing as u64
     }
-    pub fn push(&mut self, mut src: GenericTrbEntry) -> Result<u64> {
+    fn push(&mut self, mut src: GenericTrbEntry) -> Result<u64> {
         // Calling get_unchecked_mut() here is safe
         // as far as this function does not move the ring out.
         let ring = unsafe { self.ring.get_unchecked_mut() };
@@ -1263,6 +1557,135 @@ impl UsbMode {
             Self::HighSpeed => 3,
             Self::SuperSpeed => 4,
             Self::Unknown(psi) => psi,
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+#[repr(C, align(16))]
+pub struct SetupStageTrb {
+    // [xHCI] 6.4.1.2.1 Setup Stage TRB
+    request_type: u8,
+    request: u8,
+    value: u16,
+    index: u16,
+    length: u16,
+    option: u32,
+    control: u32,
+}
+const _: () = assert!(size_of::<SetupStageTrb>() == 16);
+impl SetupStageTrb {
+    // bnRequest bit[7]: Data Transfer Direction
+    //      0: Host to Device
+    //      1: Device to Host
+    pub const REQ_TYPE_DIR_DEVICE_TO_HOST: u8 = 1 << 7;
+    pub const REQ_TYPE_DIR_HOST_TO_DEVICE: u8 = 0 << 7;
+    // bnRequest bit[5..=6]: Request Type
+    //      0: Standard
+    //      1: Class
+    //      2: Vendor
+    //      _: Reserved
+    //pub const REQ_TYPE_TYPE_STANDARD: u8 = 0 << 5;
+    pub const REQ_TYPE_TYPE_CLASS: u8 = 1 << 5;
+    pub const REQ_TYPE_TYPE_VENDOR: u8 = 2 << 5;
+    // bnRequest bit[0..=4]: Recipient
+    //      0: Device
+    //      1: Interface
+    //      2: Endpoint
+    //      3: Other
+    //      _: Reserved
+    pub const REQ_TYPE_TO_DEVICE: u8 = 0;
+    pub const REQ_TYPE_TO_INTERFACE: u8 = 1;
+    //pub const REQ_TYPE_TO_ENDPOINT: u8 = 2;
+    //pub const REQ_TYPE_TO_OTHER: u8 = 3;
+
+    pub const REQ_GET_REPORT: u8 = 1;
+    pub const REQ_GET_DESCRIPTOR: u8 = 6;
+    pub const REQ_SET_CONFIGURATION: u8 = 9;
+    pub const REQ_SET_INTERFACE: u8 = 11;
+    pub const REQ_SET_PROTOCOL: u8 = 0x0b;
+
+    pub fn new(
+        request_type: u8,
+        request: u8,
+        value: u16,
+        index: u16,
+        length: u16,
+    ) -> Self {
+        // Table 4-7: USB SETUP Data to Data Stage TRB and Status Stage TRB
+        // mapping
+        const TRT_NO_DATA_STAGE: u32 = 0;
+        const TRT_OUT_DATA_STAGE: u32 = 2;
+        const TRT_IN_DATA_STAGE: u32 = 3;
+        let transfer_type = if length == 0 {
+            TRT_NO_DATA_STAGE
+        } else if request & Self::REQ_TYPE_DIR_DEVICE_TO_HOST != 0 {
+            TRT_IN_DATA_STAGE
+        } else {
+            TRT_OUT_DATA_STAGE
+        };
+        Self {
+            request_type,
+            request,
+            value,
+            index,
+            length,
+            option: 8,
+            control: transfer_type << 16
+                | (TrbType::SetupStage as u32) << 10
+                | GenericTrbEntry::CTRL_BIT_IMMEDIATE_DATA,
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+#[repr(C, align(16))]
+pub struct DataStageTrb {
+    buf: u64,
+    option: u32,
+    control: u32,
+}
+const _: () = assert!(size_of::<DataStageTrb>() == 16);
+impl DataStageTrb {
+    pub fn new_in<T: Sized>(buf: Pin<&mut [T]>) -> Self {
+        Self {
+            buf: buf.as_ptr() as u64,
+            option: (buf.len() * size_of::<T>()) as u32,
+            control: (TrbType::DataStage as u32) << 10
+                | GenericTrbEntry::CTRL_BIT_DATA_DIR_IN
+                | GenericTrbEntry::CTRL_BIT_INTERRUPT_ON_COMPLETION
+                | GenericTrbEntry::CTRL_BIT_INTERRUPT_ON_SHORT_PACKET,
+        }
+    }
+}
+
+// Status stage direction will be opposite of the data.
+// If there is no data trandfer, status direction should be "in".
+// See table 4-7 of xHCI spec.
+#[derive(Copy, Clone)]
+#[repr(C, align(16))]
+struct StatusStageTrb {
+    reserved: u64,
+    option: u32,
+    control: u32,
+}
+const _: () = assert!(size_of::<StatusStageTrb>() == 16);
+impl StatusStageTrb {
+    fn new_out() -> Self {
+        Self {
+            reserved: 0,
+            option: 0,
+            control: (TrbType::StatusStage as u32) << 10,
+        }
+    }
+    pub fn new_in() -> Self {
+        Self {
+            reserved: 0,
+            option: 0,
+            control: (TrbType::StatusStage as u32) << 10
+                | GenericTrbEntry::CTRL_BIT_DATA_DIR_IN
+                | GenericTrbEntry::CTRL_BIT_INTERRUPT_ON_COMPLETION
+                | GenericTrbEntry::CTRL_BIT_INTERRUPT_ON_SHORT_PACKET,
         }
     }
 }
