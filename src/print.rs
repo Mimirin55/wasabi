@@ -1,3 +1,4 @@
+use crate::graphics::Bitmap;
 use crate::graphics::BitmapTextWriter;
 use crate::mutex::Mutex;
 use crate::serial::SerialPort;
@@ -12,7 +13,11 @@ pub fn set_global_vram(vram: VramBufferInfo) {
     let w = BitmapTextWriter::new(vram);
     *GLOBAL_VRAM_WRITER.lock() = Some(w);
 }
-
+pub fn get_global_vram_resolutions() -> Option<(i64, i64)> {
+    (GLOBAL_VRAM_WRITER.lock())
+        .as_ref()
+        .map(|vram| (vram.buf().width(), vram.buf().height()))
+}
 pub fn global_print(args: fmt::Arguments) {
     let mut writer = SerialPort::default();
     fmt::write(&mut writer, args).unwrap();
@@ -40,17 +45,17 @@ macro_rules! info {
 
 #[macro_export]
 macro_rules! warn {
-  ($($arg:tt)*) => ($crate::print!("[WARN] {}:{:<3}: {}\n",
+    ($($arg:tt)*) => ($crate::print!("[WARN] {}:{:<3}: {}\n",
     file!(), line!(), format_args!($($arg)*)));
 }
 
 #[macro_export]
 macro_rules! error {
-  ($($arg:tt)*) => ($crate::print!("[ERROR] {}:{:<3}: {}\n",
+    ($($arg:tt)*) => ($crate::print!("[ERROR] {}:{:<3}: {}\n",
     file!(), line!(), format_args!($($arg)*)));
 }
 
-fn hexdump_bytes(bytes: &[u8]) {
+pub fn hexdump_bytes(bytes: &[u8]) {
     let mut i = 0;
     let mut ascii = [0u8; 16];
     let mut offset = 0;
@@ -101,6 +106,7 @@ fn hexdump_bytes(bytes: &[u8]) {
         println!("|");
     }
 }
-pub fn hexdump<T: Sized>(data: &T) {
+pub fn hexdump_struct<T: Sized>(data: &T) {
+    info!("hexdump_struct: {:?}", core::any::type_name::<T>());
     hexdump_bytes(unsafe { slice::from_raw_parts(data as *const T as *const u8, size_of::<T>()) })
 }
