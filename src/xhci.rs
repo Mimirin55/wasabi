@@ -162,7 +162,7 @@ impl PciXhciDriver {
             )
             .await
             {
-                let lang_id = e[1];
+                let lang_id = u16::from_le_bytes([e[0], e[1]]);
                 let vendor = if device_descriptor.manufacture_idx != 0 {
                     Some(
                         usb::request_string_descriptor(
@@ -732,14 +732,14 @@ impl Controller {
             .lock()
             .set_output_context(slot, output_context);
     }
-    pub async fn request_descriptor<T: Sized>(
+    pub async fn request_descriptor(
         &self,
         slot: u8,
         ctrl_ep_ring: &mut CommandRing,
         desc_type: usb::UsbDescriptorType,
         desc_index: u8,
         lang_id: u16,
-        buf: Pin<&mut [T]>,
+        buf: &mut Pin<Box<[u8]>>,
     ) -> Result<()> {
         ctrl_ep_ring.push(
             SetupStageTrb::new(
@@ -747,7 +747,7 @@ impl Controller {
                 SetupStageTrb::REQ_GET_DESCRIPTOR,
                 (desc_type as u16) << 8 | (desc_index as u16),
                 lang_id,
-                (buf.len() * size_of::<T>()) as u16,
+                buf.len() as u16,
             )
             .into(),
         )?;
@@ -759,14 +759,14 @@ impl Controller {
             .await?
             .transfer_result_ok()
     }
-    pub async fn request_descriptor_for_interface<T: Sized>(
+    pub async fn request_descriptor_for_interface(
         &self,
         slot: u8,
         ctrl_ep_ring: &mut CommandRing,
         desc_type: usb::UsbDescriptorType,
         desc_index: u8,
         w_index: u16,
-        buf: Pin<&mut [T]>,
+        buf: &mut Pin<Box<[u8]>>,
     ) -> Result<()> {
         ctrl_ep_ring.push(
             SetupStageTrb::new(
@@ -775,7 +775,7 @@ impl Controller {
                 SetupStageTrb::REQ_GET_DESCRIPTOR,
                 (desc_type as u16) << 8 | (desc_index as u16),
                 w_index,
-                (buf.len() * size_of::<T>()) as u16,
+                buf.len() as u16,
             )
             .into(),
         )?;
@@ -791,7 +791,7 @@ impl Controller {
         &self,
         slot: u8,
         ctrl_ep_ring: &mut CommandRing,
-        buf: Pin<&mut [u8]>,
+        buf: &mut Pin<Box<[u8]>>,
     ) -> Result<()> {
         // [HID] 7.2.1 Get_Report Request
         ctrl_ep_ring.push(
@@ -1647,10 +1647,10 @@ pub struct DataStageTrb {
 }
 const _: () = assert!(size_of::<DataStageTrb>() == 16);
 impl DataStageTrb {
-    pub fn new_in<T: Sized>(buf: Pin<&mut [T]>) -> Self {
+    pub fn new_in(buf: &mut Pin<Box<[u8]>>) -> Self {
         Self {
             buf: buf.as_ptr() as u64,
-            option: (buf.len() * size_of::<T>()) as u32,
+            option: buf.len() as u32,
             control: (TrbType::DataStage as u32) << 10
                 | GenericTrbEntry::CTRL_BIT_DATA_DIR_IN
                 | GenericTrbEntry::CTRL_BIT_INTERRUPT_ON_COMPLETION
